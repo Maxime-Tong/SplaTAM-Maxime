@@ -277,7 +277,9 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	const float* __restrict__ depth,
-	float* __restrict__ out_depth)
+	float* __restrict__ out_depth,
+	float* __restrict__ rounds_buffer,
+	int* __restrict__ visible_gaussian)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -369,7 +371,7 @@ renderCUDA(
             // Mean depth:
 //             float dep = collected_depth[j];
 //             D += dep * alpha * T;
-			// atomicCAS(&visible_gaussian[collected_id[j]], 0, 1);
+			atomicCAS(&visible_gaussian[collected_id[j]], 0, 1);
 
             // Median depth:
             if (T > 0.5f && test_T < 0.5)
@@ -396,7 +398,7 @@ renderCUDA(
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 		out_depth[pix_id] = D;
-		// rounds_buffer[pix_id] = (float)rounds;
+		rounds_buffer[pix_id] = (float)rounds;
 	}
 }
 
@@ -415,15 +417,15 @@ void FORWARD::render(
 	const float* depth,
 	float* out_depth)
 {
-	// const int TOTAL_ELEMENTS = grid.x * grid.y * BLOCK_SIZE;
-	// float* rounds_buffer;
-	// int* visible_gaussian;
+	const int TOTAL_ELEMENTS = grid.x * grid.y * BLOCK_SIZE;
+	float* rounds_buffer;
+	int* visible_gaussian;
 
-	// cudaMalloc((void**)&rounds_buffer, TOTAL_ELEMENTS * sizeof(float));
-	// cudaMemset(rounds_buffer, 0, TOTAL_ELEMENTS * sizeof(float));
+	cudaMalloc((void**)&rounds_buffer, TOTAL_ELEMENTS * sizeof(float));
+	cudaMemset(rounds_buffer, 0, TOTAL_ELEMENTS * sizeof(float));
 
-	// cudaMalloc((void**)&visible_gaussian, P * sizeof(int));
-	// cudaMemset(visible_gaussian, 0, P * sizeof(int));
+	cudaMalloc((void**)&visible_gaussian, P * sizeof(int));
+	cudaMemset(visible_gaussian, 0, P * sizeof(int));
 
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -437,17 +439,19 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		depth,
-		out_depth);
+		out_depth,
+		rounds_buffer,
+		visible_gaussian);
 
-    // thrust::device_ptr<float> rounds_ptr(rounds_buffer);
-    // float rounds_sum = thrust::reduce(rounds_ptr, rounds_ptr + TOTAL_ELEMENTS);
-    // thrust::device_ptr<int> visible_ptr(visible_gaussian);
-    // int visible_sum = thrust::reduce(visible_ptr, visible_ptr + P);
+    thrust::device_ptr<float> rounds_ptr(rounds_buffer);
+    float rounds_sum = thrust::reduce(rounds_ptr, rounds_ptr + TOTAL_ELEMENTS);
+    thrust::device_ptr<int> visible_ptr(visible_gaussian);
+    int visible_sum = thrust::reduce(visible_ptr, visible_ptr + P);
 
-    // std::cout << "Mean of rounds buffer: " << rounds_sum / TOTAL_ELEMENTS << " Sum of visible gaussian: " << visible_sum << " Total Guassian: " << P << std::endl;
+    std::cout << "Mean of rounds buffer: " << rounds_sum / TOTAL_ELEMENTS << " Sum of visible gaussian: " << visible_sum << " Total Guassian: " << P << std::endl;
     
-    // cudaFree(rounds_buffer);
-	// cudaFree(visible_gaussian);
+    cudaFree(rounds_buffer);
+	cudaFree(visible_gaussian);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
