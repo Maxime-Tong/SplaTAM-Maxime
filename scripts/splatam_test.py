@@ -944,6 +944,18 @@ def rgbd_slam(config: dict):
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
                 keyframe_time_indices.append(time_idx)
+                
+        if config['visualize_mask']:
+            pixel_mask = adaptive_random_sampling(color, 4096)
+            row_indices, col_indices = torch.where(pixel_mask)
+            color_masked = color.clone()
+            red = torch.tensor([255, 0, 0], dtype=color.dtype, device=color.device)
+            color_masked[row_indices, col_indices] = red
+            save_image = color_masked.cpu().numpy()
+            save_masked_dir = os.path.join(eval_dir, "masked_frames")
+
+            os.makedirs(save_masked_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(save_masked_dir, "{:04d}.png".format(time_idx)), cv2.cvtColor(save_image, cv2.COLOR_RGB2BGR))
         
         # Checkpoint every iteration
         if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
