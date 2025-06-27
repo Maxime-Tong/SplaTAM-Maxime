@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 def adaptive_random_sampling(
     image: torch.Tensor, 
+    novelty: torch.Tensor,
     num_samples: int, 
     epsilon: float = 0.001,
     sobel_kernel_size: int = 3
@@ -61,7 +62,7 @@ def adaptive_random_sampling(
     G_min = G.min()
     G_max = G.max()
     G_norm = 1 - (G - G_min) / (G_max - G_min + 1e-7)  # Avoid division by zero
-    
+
     # Step 4: Create sampling probability map
     P = G_norm + epsilon
     P_flat = P.view(-1)  # Flatten to (H*W,)
@@ -83,10 +84,15 @@ def adaptive_random_sampling(
     
     return mask
 
-def generate_random_mask(H, W, num_samples, device):
+def generate_random_mask(H, W, num_samples, novelty=None, device='cuda'):
     mask = torch.zeros((H, W), dtype=bool, device=device)
     selected_indices = torch.randperm(H * W, device=device)[:num_samples]    
-    mask.view(-1)[selected_indices] = True
+    mask_flat = mask.view(-1)
+    mask_flat[selected_indices] = True
+    
+    if novelty is not None:
+        mask_flat = mask_flat | novelty
+        
     return mask
 
 # for tracking

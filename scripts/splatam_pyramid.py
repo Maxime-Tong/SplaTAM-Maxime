@@ -33,11 +33,11 @@ from utils.slam_helpers import (
     transform_to_frame, l1_loss_v1, matrix_to_quaternion
 )
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
-from utils.tile_mask_utils import *
+from utils.mask_utils import generate_pixel_mask, adaptive_random_sampling, generate_random_mask
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
-from utils.scale_utils import scale_image_tensor, adjust_learning_rate_global
-from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
+from utils.scale_utils import adjust_intrinsics, downsample_center
+
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
     if config_dict["dataset_name"].lower() in ["icl"]:
@@ -64,6 +64,7 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
         return NeRFCaptureDataset(basedir, sequence, **kwargs)
     else:
         raise ValueError(f"Unknown dataset name {config_dict['dataset_name']}")
+
 
 def get_pointcloud(color, depth, intrinsics, w2c, transform_pts=True, 
                    mask=None, compute_mean_sq_dist=False, mean_sq_dist_method="projective"):
@@ -158,32 +159,14 @@ def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribut
     return params, variables
 
 
-def initialize_optimizer(params, lrs_dict, tracking, scale=1.0):
+def initialize_optimizer(params, lrs_dict, tracking):
     lrs = lrs_dict
-    param_groups = [{'params': [v], 'name': k, 'lr': lrs[k] * scale} for k, v in params.items()]
+    param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]} for k, v in params.items()]
     if tracking:
         return torch.optim.Adam(param_groups)
     else:
         return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
 
-def initialize_multi_scale_cam(scale_list, w_original, h_original, K, w2c, near=0.01, far=100):
-    rets = []
-    for scale in scale_list:
-        w, h = int(w_original * scale), int(h_original * scale)
-        K_scaled = np.copy(K)
-        
-        K_scaled[0, 0] *= scale  # fx
-        K_scaled[1, 1] *= scale  # fy
-        K_scaled[0, 2] = K_scaled[0, 2] * scale  # cx
-        K_scaled[1, 2] = K_scaled[1, 2] * scale  # cy
-        
-        rets.append({
-            'cam': setup_camera(w, h, K_scaled, w2c, near, far),
-            'intrinsics': K_scaled,
-            'scale': scale
-        })
-        
-    return rets
 
 def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, 
                               mean_sq_dist_method, densify_dataset=None, gaussian_distribution=None):
@@ -232,7 +215,7 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
 
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
-             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None, pixel_mask=None, save=False):
+             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None, pixel_mask=None):
     # Initialize Loss Dictionary
     losses = {}
 
@@ -276,17 +259,6 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     depth_sq = depth_sil[2, :, :].unsqueeze(0)
     uncertainty = depth_sq - depth**2
     uncertainty = uncertainty.detach()
-    
-    if save:
-        viz_render_im = torch.clamp(im, 0, 1).detach().cpu().permute(1, 2, 0).numpy()
-        cv2.imwrite("output/scale_image.png", cv2.cvtColor(viz_render_im*255, cv2.COLOR_RGB2BGR))
-        
-        viz_render_depth = depth_sil[0].detach().cpu().numpy()
-        vmin = 0
-        vmax = 6
-        normalized_depth = np.clip((viz_render_depth - vmin) / (vmax - vmin), 0, 1)
-        depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        cv2.imwrite("output/scale_depth.png", depth_colormap)
 
     # Mask with valid depth values (accounts for outlier depth values)
     nan_mask = (~torch.isnan(depth)) & (~torch.isnan(uncertainty))
@@ -297,19 +269,13 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     else:
         mask = (curr_data['depth'] > 0)
     mask = mask & nan_mask
-    
-    if pixel_mask is not None:
-        mask = mask & pixel_mask
-
     # Mask with presence silhouette mask (accounts for empty space)
     if tracking and use_sil_for_loss:
         mask = mask & presence_sil_mask
         
-    # if mapping and 'non_presence_mask' in variables:
-    #     _, H, W = mask.shape
-    #     non_presence_mask = variables['non_presence_mask'].reshape(H, W)
-    #     mask = mask & (non_presence_mask)
-        
+    if pixel_mask is not None:
+        mask = mask & pixel_mask
+
     # Depth loss
     if use_l1:
         mask = mask.detach()
@@ -361,14 +327,14 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
                 ax[i, j].axis('off')
         # Set Title
         fig.suptitle(f"Tracking Iteration: {tracking_iteration}", fontsize=16)
-        # Figure Tight Layou
+        # Figure Tight Layout
         fig.tight_layout()
         os.makedirs(plot_dir, exist_ok=True)
         plt.savefig(os.path.join(plot_dir, f"tmp.png"), bbox_inches='tight')
         plt.close()
-        # plot_img = cv2.imread(os.path.join(plot_dir, f"tmp.png"))
-        # cv2.imshow('Diff Images', plot_img)
-        # cv2.waitKey(1)
+        plot_img = cv2.imread(os.path.join(plot_dir, f"tmp.png"))
+        cv2.imshow('Diff Images', plot_img)
+        cv2.waitKey(1)
         ## Save Tracking Loss Viz
         # save_plot_dir = os.path.join(plot_dir, f"tracking_%04d" % iter_time_idx)
         # os.makedirs(save_plot_dir, exist_ok=True)
@@ -382,6 +348,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     variables['max_2D_radius'][seen] = torch.max(radius[seen], variables['max_2D_radius'][seen])
     variables['seen'] = seen
     weighted_losses['loss'] = loss
+
     return loss, variables, weighted_losses
 
 
@@ -442,7 +409,6 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         curr_w2c[:3, 3] = curr_cam_tran
         valid_depth_mask = (curr_data['depth'][0, :, :] > 0)
         non_presence_mask = non_presence_mask & valid_depth_mask.reshape(-1)
-        
         new_pt_cld, mean3_sq_dist = get_pointcloud(curr_data['im'], curr_data['depth'], curr_data['intrinsics'], 
                                     curr_w2c, mask=non_presence_mask, compute_mean_sq_dist=True,
                                     mean_sq_dist_method=mean_sq_dist_method)
@@ -455,8 +421,7 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         variables['max_2D_radius'] = torch.zeros(num_pts, device="cuda").float()
         new_timestep = time_idx*torch.ones(new_pt_cld.shape[0],device="cuda").float()
         variables['timestep'] = torch.cat((variables['timestep'],new_timestep),dim=0)
-        
-        variables['non_presence_mask'] = non_presence_mask
+    variables['novelty'] = non_presence_mask
     return params, variables
 
 
@@ -678,39 +643,22 @@ def rgbd_slam(config: dict):
                 keyframe_list.append(curr_keyframe)
     else:
         checkpoint_time_idx = 0
-        
-    # keypoints_all_frames = []
-    use_sparse = config['tracking'].get('use_sparse', False)
-    sparse_fn = config['sparse_fn']
-    print("#"*10)
-    print(f"Use sparse: {use_sparse}")
-    print("#"*10)
+    
+    use_pyramid = True
+    use_sparse = config['use_sparse']
+    tile_size = config['tile_size']
+    
+    if use_pyramid:
+        intrinsics_scaled = adjust_intrinsics(intrinsics, tile_size)
+        cam_scaled = setup_camera(cam.image_width // tile_size, 
+                                  cam.image_height / tile_size, 
+                                  intrinsics_scaled.cpu().numpy(), 
+                                  first_frame_w2c.detach().cpu().numpy())
     
     # Iterate over Scan
-    t_size = (16, 16)
-    pose = dataset[0][-1]
-    w2c = torch.linalg.inv(pose)
-    cam_dict = initialize_multi_scale_cam([0.5, 0.75, 1.0], cam.image_width, cam.image_height, intrinsics.cpu().numpy(), w2c.detach().cpu().numpy())
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
         # Load RGBD frames incrementally instead of all frames
         color, depth, _, gt_pose = dataset[time_idx]
-        
-        # Extract fast features
-        # keypoints = extract_keypoints(color.cpu().numpy(), fast)
-        if use_sparse:
-            if 'global' in sparse_fn:
-                H, W, C = color.shape
-                num_to_sample = ((H + t_size[1] - 1) // t_size[1]) * ((W + t_size[0] - 1) // t_size[0])
-                pixel_mask = generate_pixel_mask(color, t_size, sparse_fn = sparse_fn, reduce_fn = 'sort', num_to_keep=num_to_sample, device='cuda')
-            else:
-                pixel_mask = generate_pixel_mask(color, t_size, sparse_fn = sparse_fn, reduce_fn = 'normal', device='cuda')
-            print(pixel_mask.sum())
-        else:
-            pixel_mask = None
-
-        # pixel_mask = torch.from_numpy(keypoints_to_mask(keypoints, color.shape, 3)).bool().to(color.device)
-        # keypoints_all_frames.append(keypoints)
-        
         # Process poses
         gt_w2c = torch.linalg.inv(gt_pose)
         # Process RGB-D Data
@@ -734,6 +682,16 @@ def rgbd_slam(config: dict):
         else:
             tracking_curr_data = curr_data
 
+        if use_sparse:
+            pixel_mask = generate_pixel_mask(tracking_curr_data['im'], (tile_size, tile_size), config['tracking_sparse_fn'], device=tracking_curr_data['im'].device)
+        else:
+            pixel_mask = None
+            
+        if use_pyramid:
+            tracking_curr_data['im'] = downsample_center(tracking_curr_data['im'], tile_size)
+            tracking_curr_data['intrinsics'] = intrinsics_scaled
+            tracking_curr_data['cam'] = cam_scaled
+        
         # Optimization Iterations
         num_iters_mapping = config['mapping']['num_iters']
         
@@ -743,7 +701,6 @@ def rgbd_slam(config: dict):
 
         # Tracking
         tracking_start_time = time.time()
-        
         if time_idx > 0 and not config['tracking']['use_gt_poses']:
             # Reset Optimizer & Learning Rates for tracking
             optimizer = initialize_optimizer(params, config['tracking']['lrs'], tracking=True)
@@ -764,6 +721,10 @@ def rgbd_slam(config: dict):
                                                    config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
                                                    plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
                                                    tracking_iteration=iter, pixel_mask=pixel_mask)
+                
+                if use_sparse and config['tracking_sparse_fn'] == 'random':
+                    pixel_mask = generate_pixel_mask(tracking_color, tile_size, config['tracking_sparse_fn'], device=tracking_color.device)
+                    
                 if config['use_wandb']:
                     # Report Loss
                     wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
@@ -843,6 +804,7 @@ def rgbd_slam(config: dict):
                 print('Failed to evaluate trajectory.')
 
         # Densification & KeyFrame-based Mapping
+        variables['novelty'] = None
         if time_idx == 0 or (time_idx+1) % config['map_every'] == 0:
             # Densification
             if config['mapping']['add_new_gaussians'] and time_idx > 0:
@@ -889,84 +851,60 @@ def rgbd_slam(config: dict):
 
             # Reset Optimizer & Learning Rates for Full Map Optimization
             optimizer = initialize_optimizer(params, config['mapping']['lrs'], tracking=False) 
+
             # Mapping
             mapping_start_time = time.time()
             if num_iters_mapping > 0:
                 progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Time Step: {time_idx}")
-            
-            rand_indices = np.random.choice(np.arange(len(selected_keyframes)), 20)
-            rand_indices = np.repeat(rand_indices, 3)
+            pixel_mask = None
             for iter in range(num_iters_mapping):
                 iter_start_time = time.time()
                 # Randomly select a frame until current time step amongst keyframes
-                # rand_idx = np.random.randint(0, len(selected_keyframes))
-                rand_idx = rand_indices[iter]
+                rand_idx = np.random.randint(0, len(selected_keyframes))
                 selected_rand_keyframe_idx = selected_keyframes[rand_idx]
                 if selected_rand_keyframe_idx == -1:
                     # Use Current Frame Data
                     iter_time_idx = time_idx
                     iter_color = color
                     iter_depth = depth
+                    iter_novelty = variables['novelty']
                 else:
                     # Use Keyframe Data
                     iter_time_idx = keyframe_list[selected_rand_keyframe_idx]['id']
                     iter_color = keyframe_list[selected_rand_keyframe_idx]['color']
                     iter_depth = keyframe_list[selected_rand_keyframe_idx]['depth']
+                    iter_novelty = keyframe_list[selected_rand_keyframe_idx]['novelty'] 
                 iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
+                iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
+                             'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
                 
-                if iter < 20:
-                    scale_data = cam_dict[0]
-                    scale = scale_data['scale']
-                    iter_data = {
-                        'cam': scale_data['cam'],
-                        'im': scale_image_tensor(iter_color, scale),
-                        'depth': scale_image_tensor(iter_depth, scale),
-                        'id': iter_time_idx, 
-                        'intrinsics': scale_data['intrinsics'],
-                        'w2c': first_frame_w2c,
-                        'iter_gt_w2c_list': iter_gt_w2c
-                    }
-                    save_tag = False
-                elif iter < 40:
-                    scale_data = cam_dict[1]
-                    scale = scale_data['scale']
-                    iter_data = {
-                        'cam': scale_data['cam'],
-                        'im': scale_image_tensor(iter_color, scale),
-                        'depth': scale_image_tensor(iter_depth, scale),
-                        'id': iter_time_idx, 
-                        'intrinsics': scale_data['intrinsics'],
-                        'w2c': first_frame_w2c,
-                        'iter_gt_w2c_list': iter_gt_w2c
-                    } 
-                    save_tag = True
-                else:
-                    iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
-                                'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
-                    save_tag = False
+                if use_sparse:
+                    C, H, W = iter_color.shape
+                    num_samples = ((H + tile_size - 1) // tile_size) * ((W + tile_size - 1) // tile_size)
+                    pixel_mask = generate_random_mask(H, W, num_samples, iter_novelty)
+                
                 # Loss for current frame
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
-                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True, save=False)
+                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True, pixel_mask=pixel_mask)
                 if config['use_wandb']:
                     # Report Loss
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
                 # Backprop
                 loss.backward()
                 with torch.no_grad():
-                    if iter >= 40:
-                        # Prune Gaussians
-                        if config['mapping']['prune_gaussians']:
-                            params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'])
-                            if config['use_wandb']:
-                                wandb_run.log({"Mapping/Number of Gaussians - Pruning": params['means3D'].shape[0],
-                                            "Mapping/step": wandb_mapping_step})
-                        # Gaussian-Splatting's Gradient-based Densification
-                        if config['mapping']['use_gaussian_splatting_densification']:
-                            params, variables = densify(params, variables, optimizer, iter, config['mapping']['densify_dict'])
-                            if config['use_wandb']:
-                                wandb_run.log({"Mapping/Number of Gaussians - Densification": params['means3D'].shape[0],
-                                            "Mapping/step": wandb_mapping_step})
+                    # Prune Gaussians
+                    if config['mapping']['prune_gaussians']:
+                        params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'])
+                        if config['use_wandb']:
+                            wandb_run.log({"Mapping/Number of Gaussians - Pruning": params['means3D'].shape[0],
+                                           "Mapping/step": wandb_mapping_step})
+                    # Gaussian-Splatting's Gradient-based Densification
+                    if config['mapping']['use_gaussian_splatting_densification']:
+                        params, variables = densify(params, variables, optimizer, iter, config['mapping']['densify_dict'])
+                        if config['use_wandb']:
+                            wandb_run.log({"Mapping/Number of Gaussians - Densification": params['means3D'].shape[0],
+                                           "Mapping/step": wandb_mapping_step})
                     # Optimizer Update
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -1021,22 +959,22 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Initialize Keyframe Info
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth}
+                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'novelty': variables['novelty']}
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
                 keyframe_time_indices.append(time_idx)
                 
-            if config['visuallize_mask']:
-                color, depth, _, gt_pose = dataset[time_idx]
-                row_indices, col_indices = torch.where(pixel_mask)
-                color_masked = color.clone()
-                red = torch.tensor([255, 0, 0], dtype=color.dtype, device=color.device)
-                color_masked[row_indices, col_indices] = red
-                
-                save_image = color_masked.cpu().numpy()
-                save_masked_dir = os.path.join(eval_dir, "masked_frames")
-                os.makedirs(save_masked_dir, exist_ok=True)
-                cv2.imwrite(os.path.join(save_masked_dir, "{:04d}.png".format(time_idx)), cv2.cvtColor(save_image, cv2.COLOR_RGB2BGR))
+        if config['visualize_mask']:
+            pixel_mask = adaptive_random_sampling(color, 4096)
+            row_indices, col_indices = torch.where(pixel_mask)
+            color_masked = (color.clone().permute(1, 2, 0) * 255).clamp(0, 255)
+            red = torch.tensor([255, 0, 0], dtype=color.dtype, device=color.device)
+            color_masked[row_indices, col_indices] = red
+            save_image = color_masked.cpu().numpy()
+            save_masked_dir = os.path.join(eval_dir, "masked_frames")
+
+            os.makedirs(save_masked_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(save_masked_dir, "{:04d}.png".format(time_idx)), cv2.cvtColor(save_image, cv2.COLOR_RGB2BGR))
         
         # Checkpoint every iteration
         if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
@@ -1107,17 +1045,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("experiment", type=str, help="Path to experiment file")
-    parser.add_argument("sparse_fn", type=str)
+    parser.add_argument("--use_sparse", action="store_true")
+    parser.add_argument("--tracking_fn", type=str, default="uniform")
+    parser.add_argument("--mapping_fn", type=str, default="adaptive_random")
+    parser.add_argument("--tile_size", type=int, default=16)
 
     args = parser.parse_args()
+
+    print(f"Use sparse: {args.use_sparse}")
+    print(f"Tracking sparse function: {args.tracking_fn}")
+    print(f"mapping sparse function: {args.mapping_fn}")
+    print(f"Tile size: {args.tile_size}")
 
     experiment = SourceFileLoader(
         os.path.basename(args.experiment), args.experiment
     ).load_module()
 
+    experiment.config['use_sparse'] = args.use_sparse
+    experiment.config['tracking_sparse_fn'] = args.tracking_fn
+    experiment.config['mapping_sparse_fn'] = args.mapping_fn
+    experiment.config['tile_size'] = args.tile_size
+
     # Set Experiment Seed
     seed_everything(seed=experiment.config['seed'])
-    experiment.config['sparse_fn'] = args.sparse_fn
     
     # Create Results Directory and Copy Config
     results_dir = os.path.join(

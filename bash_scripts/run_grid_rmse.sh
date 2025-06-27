@@ -8,36 +8,44 @@ echo "Detected $num_gpus GPUs"
 task_count=1
 
 # 手动指定 tile_x 和 tile_y 的组合
-tile_combinations=(
-    # "8 8"
-    "16 16"
+args_combinations=(
+    "16 8 uniform normal"
+    "16 8 uniform random"
+    "16 8 uniform novelty"
+    "16 8 uniform novelty_random"
     # "32 32"
 )
 
-for scene in 0 1 2 3 4 5 6
+for scene in 0 3
 do
-    for combo in "${tile_combinations[@]}"
+    # (
+    #     export SCENE_NUM=${scene}
+    #     export GROUP_NAME="original"
+    #     echo "Running scene ${SCENE_NUM} (${GROUP_NAME}) on GPU ${gpu_id}"
+    #     python3 -u scripts/splatam.py configs/replica/replica_eval_test.py > logs/${GROUP_NAME}_${scene}.log 2>&1
+    #     echo "Task scene ${SCENE_NUM} (${GROUP_NAME}) completed on GPU ${gpu_id}" 
+    # ) &
+
+    for combo in "${args_combinations[@]}"
     do
-        # 分割组合为 tile_x 和 tile_y
-        tile_x=$(echo $combo | awk '{print $1}')
-        tile_y=$(echo $combo | awk '{print $2}')
+        t_scale=$(echo $combo | awk '{print $1}')
+        m_scale=$(echo $combo | awk '{print $2}')
+        t_fn=$(echo $combo | awk '{print $3}')
+        m_fn=$(echo $combo | awk '{print $4}')
         
-        for trakcing_fn in random uniform
-        do
-            gpu_id=$((task_count % num_gpus))
-            export CUDA_VISIBLE_DEVICES=$gpu_id
-            task_count=$((task_count + 1))
+        
+        gpu_id=$((task_count % num_gpus))
+        export CUDA_VISIBLE_DEVICES=$gpu_id
+        task_count=$((task_count + 1))
+        (
+            export SCENE_NUM=${scene}
+            export GROUP_NAME="${t_fn}_${t_scale}_${m_fn}_${m_scale}"
+            echo "Running scene ${SCENE_NUM} (${GROUP_NAME}) on GPU ${gpu_id}"
+            python3 -u scripts/splatam.py configs/replica/replica_eval_test.py --tracking_fn $t_fn --tracking_scale $t_scale --mapping_fn $m_fn --mapping_fn $m_scale > logs/${GROUP_NAME}_${scene}.log 2>&1
+            echo "Task scene ${SCENE_NUM} (${GROUP_NAME}) completed on GPU ${gpu_id}"
+        ) &
 
-            (
-                export SCENE_NUM=${scene}
-                export GROUP_NAME="${fn}_${tile_x}_${tile_y}_mapping_sparse"
-                echo "Running scene ${SCENE_NUM} (${GROUP_NAME}) on GPU ${gpu_id}"
-                python3 -u scripts/splatam.py configs/replica/replica_eval_test.py --use_sparse --tracking_fn $trakcing_fn --tile_size 16 --mapping_fn adaptive_random  > logs/${GROUP_NAME}_${scene}.log 2>&1
-                echo "Task scene ${SCENE_NUM} (${GROUP_NAME}) completed on GPU ${gpu_id}"
-            ) &
-
-            sleep 2
-        done
+        sleep 2
     done
 done
 

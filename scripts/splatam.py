@@ -33,7 +33,7 @@ from utils.slam_helpers import (
     transform_to_frame, l1_loss_v1, matrix_to_quaternion
 )
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
-from utils.mask_utils import generate_pixel_mask, adaptive_random_sampling
+from utils.mask_utils import generate_pixel_mask
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
 
@@ -419,7 +419,8 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         variables['max_2D_radius'] = torch.zeros(num_pts, device="cuda").float()
         new_timestep = time_idx*torch.ones(new_pt_cld.shape[0],device="cuda").float()
         variables['timestep'] = torch.cat((variables['timestep'],new_timestep),dim=0)
-
+    
+    variables['novelty'] = non_presence_mask
     return params, variables
 
 
@@ -642,8 +643,10 @@ def rgbd_slam(config: dict):
     else:
         checkpoint_time_idx = 0
     
-    use_sparse = config['use_sparse']
-    tile_size = config['tile_size']
+    tracking_scale = config['tracking_scale']
+    tracking_sample_fn = config['tracking_sample_fn']
+    mapping_scale = config['mapping_scale']
+    mapping_sample_fn = config['mapping_sample_fn']
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
         # Load RGBD frames incrementally instead of all frames
@@ -671,8 +674,8 @@ def rgbd_slam(config: dict):
         else:
             tracking_curr_data = curr_data
 
-        if use_sparse:
-            pixel_mask = generate_pixel_mask(tracking_color, tile_size, config['tracking_sparse_fn'], device=tracking_color.device)
+        if tracking_sample_fn != 'normal':
+            pixel_mask = generate_pixel_mask(tracking_curr_data['im'], (tracking_scale, tracking_scale), tracking_sample_fn, device=tracking_curr_data['im'].device)
         else:
             pixel_mask = None
         
@@ -706,8 +709,8 @@ def rgbd_slam(config: dict):
                                                    plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
                                                    tracking_iteration=iter, pixel_mask=pixel_mask)
                 
-                if use_sparse and config['tracking_sparse_fn'] == 'random':
-                    pixel_mask = generate_pixel_mask(tracking_color, tile_size, config['tracking_sparse_fn'], device=tracking_color.device)
+                # if config_sample_fn == 'random':
+                    # pixel_mask = generate_pixel_mask(tracking_curr_data['im'], (tracking_scale, tracking_scale), tracking_sample_fn, device=tracking_curr_data['im'].device) 
                     
                 if config['use_wandb']:
                     # Report Loss
@@ -788,6 +791,7 @@ def rgbd_slam(config: dict):
                 print('Failed to evaluate trajectory.')
 
         # Densification & KeyFrame-based Mapping
+        variables['novelty'] = None
         if time_idx == 0 or (time_idx+1) % config['map_every'] == 0:
             # Densification
             if config['mapping']['add_new_gaussians'] and time_idx > 0:
@@ -850,20 +854,31 @@ def rgbd_slam(config: dict):
                     iter_time_idx = time_idx
                     iter_color = color
                     iter_depth = depth
+                    iter_novelty = variables['novelty']
                 else:
                     # Use Keyframe Data
                     iter_time_idx = keyframe_list[selected_rand_keyframe_idx]['id']
                     iter_color = keyframe_list[selected_rand_keyframe_idx]['color']
                     iter_depth = keyframe_list[selected_rand_keyframe_idx]['depth']
+                    iter_novelty = keyframe_list[selected_rand_keyframe_idx]['novelty'] 
                 iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
                 iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
                              'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
                 
-                if use_sparse:
+                if mapping_sample_fn != 'normal':
                     C, H, W = iter_color.shape
-                    num_samples = ((H + tile_size[1] - 1) // tile_size[1]) * ((W + tile_size[0] - 1) // tile_size[0])
-                    pixel_mask = adaptive_random_sampling(iter_color, num_samples)
-                
+                    
+                    pixel_mask = torch.zeros((H, W), dtype=bool, device=iter_color.device)
+                    
+                    mask_flat = pixel_mask.view(-1)
+                    if 'novelty' in mapping_sample_fn:
+                        mask_flat |= iter_novelty
+                    
+                    if 'random' in mapping_sample_fn:
+                        num_samples = ((H + mapping_scale - 1) // mapping_scale) * ((W + mapping_scale - 1) // mapping_scale)
+                        selected_indices = torch.randperm(H * W, device=device)[:num_samples]
+                        mask_flat[selected_indices] = True
+                        
                 # Loss for current frame
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
@@ -940,7 +955,7 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Initialize Keyframe Info
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth}
+                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'novelty': variables['novelty']}
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
                 keyframe_time_indices.append(time_idx)
@@ -1014,10 +1029,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("experiment", type=str, help="Path to experiment file")
-    parser.add_argument("--use_sparse", action="store_true")
-    parser.add_argument("--tracking_fn", type=str, default="uniform")
-    parser.add_argument("--mapping_fn", type=str, default="adaptive_random")
-    parser.add_argument("--tile_size", type=int, default=16)
+    parser.add_argument("--tracking_fn", type=str, default="normal")
+    parser.add_argument("--mapping_fn", type=str, default="normal")
+    parser.add_argument("--tracking_scale", type=int, default=16)
+    parser.add_argument("--mapping_scale", type=int, default=8)
 
     args = parser.parse_args()
 
@@ -1025,11 +1040,16 @@ if __name__ == "__main__":
         os.path.basename(args.experiment), args.experiment
     ).load_module()
 
-    experiment.config['use_sparse'] = args.use_sparse
-    experiment.config['tracking_sparse_fn'] = args.tracking_fn
-    experiment.config['mapping_sparse_fn'] = args.mapping_fn
-    experiment.config['tile_size'] = args.tile_size
-
+    experiment.config['tracking_sample_fn'] = args.tracking_fn
+    experiment.config['mapping_sample_fn'] = args.mapping_fn
+    experiment.config['tracking_scale'] = args.tracking_scale
+    experiment.config['mapping_scale'] = args.mapping_scale
+    
+    print(f"Tracking sparse function: {args.tracking_fn}")
+    print(f"mapping sparse function: {args.mapping_fn}")
+    print(f"Tracking scale size: {args.tracking_scale}, Mapping scale size: {args.mapping_scale}")
+    print(f"Data: {experiment.config['data']['sequence']}")
+    
     # Set Experiment Seed
     seed_everything(seed=experiment.config['seed'])
     

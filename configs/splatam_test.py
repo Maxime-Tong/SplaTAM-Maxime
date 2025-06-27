@@ -3,7 +3,7 @@ from os.path import join as p_join
 
 scenes = ["room0", "room1", "room2",
           "office0", "office1", "office2",
-          "office_", "office4"]
+          "office_3", "office4"]
 
 primary_device="cuda:0"
 seed = 0
@@ -19,7 +19,7 @@ group_name = "test"
 run_name = f"{scene_name}_{seed}"
 
 config = dict(
-    visualize_mask=True,
+    visualize_mask=False,
     workdir=f"./experiments/{group_name}",
     run_name=run_name,
     seed=seed,
@@ -58,7 +58,6 @@ config = dict(
         num_frames=100,
     ),
     tracking=dict(
-        use_sparse=True,
         # visualize_tracking_loss=True,
         use_gt_poses=False, # Use GT Poses for Tracking
         forward_prop=True, # Forward Propagate Poses
