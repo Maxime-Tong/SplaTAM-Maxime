@@ -63,7 +63,7 @@ def create_window(window_size, channel):
     return window
 
 
-def calc_ssim(img1, img2, window_size=11, size_average=True):
+def calc_ssim(img1, img2, window_size=11, size_average=True, color_mask=None):
     channel = img1.size(-3)
     window = create_window(window_size, channel)
 
@@ -71,10 +71,10 @@ def calc_ssim(img1, img2, window_size=11, size_average=True):
         window = window.cuda(img1.get_device())
     window = window.type_as(img1)
 
-    return _ssim(img1, img2, window, window_size, channel, size_average)
+    return _ssim(img1, img2, window, window_size, channel, size_average, color_mask)
 
 
-def _ssim(img1, img2, window, window_size, channel, size_average=True):
+def _ssim(img1, img2, window, window_size, channel, size_average=True, color_mask=None):
     mu1 = func.conv2d(img1, window, padding=window_size // 2, groups=channel)
     mu2 = func.conv2d(img2, window, padding=window_size // 2, groups=channel)
 
@@ -90,6 +90,9 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     c2 = 0.03 ** 2
 
     ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2))
+
+    if color_mask is not None:
+        ssim_map = ssim_map[color_mask]
 
     if size_average:
         return ssim_map.mean()

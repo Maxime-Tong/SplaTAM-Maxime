@@ -16,7 +16,7 @@ args_combinations=(
     # "32 32"
 )
 
-for scene in 0 3
+for scene in 7
 do
     # (
     #     export SCENE_NUM=${scene}
@@ -41,7 +41,7 @@ do
             export SCENE_NUM=${scene}
             export GROUP_NAME="${t_fn}_${t_scale}_${m_fn}_${m_scale}"
             echo "Running scene ${SCENE_NUM} (${GROUP_NAME}) on GPU ${gpu_id}"
-            python3 -u scripts/splatam.py configs/replica/replica_eval_test.py --tracking_fn $t_fn --tracking_scale $t_scale --mapping_fn $m_fn --mapping_fn $m_scale > logs/${GROUP_NAME}_${scene}.log 2>&1
+            python3 -u scripts/splatam.py configs/replica/replica_eval_test.py --tracking_fn $t_fn --tracking_scale $t_scale --mapping_fn $m_fn --mapping_scale $m_scale > logs/${GROUP_NAME}_${scene}.log 2>&1
             echo "Task scene ${SCENE_NUM} (${GROUP_NAME}) completed on GPU ${gpu_id}"
         ) &
 

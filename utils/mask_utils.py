@@ -4,9 +4,137 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+def expand_mask_to_3x3(mask):
+    # (1, 1, H, W)
+    mask_float = mask.float().unsqueeze(0).unsqueeze(0)
+    kernel = torch.ones(1, 1, 3, 3, device=mask.device)    
+    expanded = F.conv2d(mask_float, kernel, padding=1)    
+    expanded = expanded.squeeze() > 0
+    return expanded
+
+def sample_texture_and_random_mask(image: torch.Tensor, 
+    num_samples: int,
+    topk: int,
+    sobel_kernel_size: int = 3):
+    C, H, W = image.shape
+    device = image.device
+    
+    # Step 1: Convert to grayscale if needed
+    if image.shape[0] == 3:
+        # Use luminance weights for RGB to grayscale conversion
+        gray = (0.299 * image[0] + 0.587 * image[1] + 0.114 * image[2])
+    else:
+        gray = image.squeeze(0)  # Remove channel dim for single-channel input
+    
+    # Step 2: Compute gradient magnitude using Sobel filters
+    # Create Sobel kernels
+    kernel_x = torch.tensor([
+        [-1, 0, 1],
+        [-2, 0, 2],
+        [-1, 0, 1]
+    ], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+    
+    kernel_y = torch.tensor([
+        [-1, -2, -1],
+        [ 0,  0,  0],
+        [ 1,  2,  1]
+    ], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+    
+    # Add batch and channel dimensions for conv2d
+    gray = gray.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    
+    # Compute gradients with padding
+    Gx = F.conv2d(gray, kernel_x, padding=sobel_kernel_size//2)
+    Gy = F.conv2d(gray, kernel_y, padding=sobel_kernel_size//2)
+    
+    # Calculate gradient magnitude
+    G = torch.sqrt(Gx.pow(2) + Gy.pow(2))
+    G = G.squeeze()  # Remove batch and channel dims -> (H, W)
+    
+    # Create edge mask to exclude border pixels affected by padding
+    border_size = sobel_kernel_size // 2
+    edge_mask = torch.ones((H, W), dtype=bool, device=device)
+    if border_size > 0:
+        edge_mask[:border_size, :] = False
+        edge_mask[-border_size:, :] = False
+        edge_mask[:, :border_size] = False
+        edge_mask[:, -border_size:] = False
+    
+    # Flatten and apply edge mask
+    G_flat = G.view(-1)
+    edge_mask_flat = edge_mask.view(-1)
+    valid_indices = torch.where(edge_mask_flat)[0]
+    
+    # Select topk from valid (non-edge) pixels only
+    valid_G = G_flat[valid_indices]
+    _, topk_rel_indices = torch.topk(valid_G, min(topk, len(valid_indices)), largest=True)
+    topk_indices = valid_indices[topk_rel_indices]
+    
+    # Random samples also from valid pixels only
+    rand_rel_indices = torch.randperm(len(valid_indices), device=device)[:num_samples]
+    rand_indices = valid_indices[rand_rel_indices]
+    
+    mask = torch.zeros((H, W), dtype=bool, device=device)
+    mask_flat = mask.view(-1)
+    
+    mask_flat[topk_indices] = True
+    mask_flat[rand_indices] = True
+    
+    return mask
+
+def sample_random_patches_mask(image_tensor, num_patches, patch_size):
+    """
+    Vectorized version: Randomly sample patches and return a boolean mask of shape (H, W),
+    where True indicates sampled pixels.
+
+    Args:
+        image_tensor (torch.Tensor): (C, H, W)
+        num_patches (int): number of patches to sample
+        patch_size (int): patch size (must be odd recommended)
+
+    Returns:
+        torch.BoolTensor: (H, W) mask indicating sampled pixels
+    """
+    C, H, W = image_tensor.shape
+    device = image_tensor.device
+    mask = torch.zeros((H, W), dtype=torch.bool, device=device)
+    
+    half = patch_size // 2
+    min_y, max_y = half, H - half
+    min_x, max_x = half, W - half
+
+    if max_y <= min_y or max_x <= min_x:
+        raise ValueError("Image too small for given patch size.")
+
+    # Random patch centers
+    ys = torch.randint(min_y, max_y, (num_patches,), device=device)
+    xs = torch.randint(min_x, max_x, (num_patches,), device=device)
+
+    # Patch offset grid (dy, dx)
+    dy = torch.arange(-half, half + 1, device=device)
+    dx = torch.arange(-half, half + 1, device=device)
+    offset_y, offset_x = torch.meshgrid(dy, dx, indexing='ij')  # shape (patch, patch)
+
+    # shape: (num_patches, patch_size, patch_size)
+    patch_y = ys[:, None, None] + offset_y[None, :, :]
+    patch_x = xs[:, None, None] + offset_x[None, :, :]
+
+    # Flatten to 1D list of coordinates
+    patch_y = patch_y.reshape(-1)
+    patch_x = patch_x.reshape(-1)
+
+    # Filter only valid pixels (redundant if sampling is constrained)
+    valid = (patch_y >= 0) & (patch_y < H) & (patch_x >= 0) & (patch_x < W)
+    patch_y = patch_y[valid]
+    patch_x = patch_x[valid]
+
+    # Use advanced indexing to update mask
+    mask[patch_y, patch_x] = True
+
+    return mask
+
 def adaptive_random_sampling(
     image: torch.Tensor, 
-    novelty: torch.Tensor,
     num_samples: int, 
     epsilon: float = 0.001,
     sobel_kernel_size: int = 3
@@ -58,10 +186,17 @@ def adaptive_random_sampling(
     G = torch.sqrt(Gx.pow(2) + Gy.pow(2))
     G = G.squeeze()  # Remove batch and channel dims -> (H, W)
     
+    border_size = sobel_kernel_size // 2
+    if border_size > 0:
+        G[:border_size, :] = epsilon
+        G[-border_size:, :] = epsilon
+        G[:, :border_size] = epsilon
+        G[:, -border_size:] = epsilon
+    
     # Step 3: Normalize gradient magnitudes to [0, 1]
     G_min = G.min()
     G_max = G.max()
-    G_norm = 1 - (G - G_min) / (G_max - G_min + 1e-7)  # Avoid division by zero
+    G_norm = (G - G_min) / (G_max - G_min + 1e-7)  # Avoid division by zero
 
     # Step 4: Create sampling probability map
     P = G_norm + epsilon

@@ -33,7 +33,8 @@ from utils.slam_helpers import (
     transform_to_frame, l1_loss_v1, matrix_to_quaternion
 )
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
-from utils.mask_utils import generate_pixel_mask
+from utils.mask_utils import *
+from utils.loss_utils import calc_ssim_shuffled_packed, gradient_loss
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
 
@@ -157,9 +158,9 @@ def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribut
     return params, variables
 
 
-def initialize_optimizer(params, lrs_dict, tracking):
+def initialize_optimizer(params, lrs_dict, tracking, scale=1.0):
     lrs = lrs_dict
-    param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]} for k, v in params.items()]
+    param_groups = [{'params': [v], 'name': k, 'lr': lrs[k] * scale} for k, v in params.items()]
     if tracking:
         return torch.optim.Adam(param_groups)
     else:
@@ -209,7 +210,6 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
         return params, variables, intrinsics, w2c, cam, densify_intrinsics, densify_cam
     else:
         return params, variables, intrinsics, w2c, cam
-
 
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
@@ -271,7 +271,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     if tracking and use_sil_for_loss:
         mask = mask & presence_sil_mask
         
-    if pixel_mask is not None:
+    if tracking and pixel_mask is not None:
         mask = mask & pixel_mask
 
     # Depth loss
@@ -290,7 +290,16 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     elif tracking:
         losses['im'] = torch.abs(curr_data['im'] - im).sum()
     else:
-        losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
+        if mapping and pixel_mask is not None:
+            # expanded_mask = expand_mask_to_3x3(pixel_mask)
+            color_mask = torch.tile(pixel_mask, (3, 1, 1))
+            color_mask = color_mask.detach()
+            # losses['im'] = 0.8 * l1_loss_v1(im[color_mask], curr_data['im'][color_mask]) + 0.2 * gradient_loss(im, curr_data['im'], pixel_mask.unsqueeze(0))
+            # losses['im'] = 0.8 * l1_loss_v1(im[color_mask], curr_data['im'][color_mask]) + 0.2 * (1.0 - calc_ssim(im, curr_data['im'], color_mask=color_mask))
+            # losses['im'] = 0.6 * l1_loss_v1(im[color_mask], curr_data['im'][color_mask]) + 0.2 * gradient_loss(im, curr_data['im'], pixel_mask.unsqueeze(0)) + 0.2 * (1.0 - calc_ssim_shuffled_packed(im, curr_data['im'], pixel_mask))
+            losses['im'] = 0.8 * l1_loss_v1(im[color_mask], curr_data['im'][color_mask]) + 0.2 * (1.0 - calc_ssim_shuffled_packed(im, curr_data['im'], pixel_mask))
+        else:
+            losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
 
     # Visualize the Diff Images
     if tracking and visualize_tracking_loss:
@@ -647,6 +656,7 @@ def rgbd_slam(config: dict):
     tracking_sample_fn = config['tracking_sample_fn']
     mapping_scale = config['mapping_scale']
     mapping_sample_fn = config['mapping_sample_fn']
+    flip = config['flip']
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
         # Load RGBD frames incrementally instead of all frames
@@ -675,9 +685,9 @@ def rgbd_slam(config: dict):
             tracking_curr_data = curr_data
 
         if tracking_sample_fn != 'normal':
-            pixel_mask = generate_pixel_mask(tracking_curr_data['im'], (tracking_scale, tracking_scale), tracking_sample_fn, device=tracking_curr_data['im'].device)
+            tracking_pixel_mask = generate_pixel_mask(tracking_curr_data['im'], (tracking_scale, tracking_scale), tracking_sample_fn, device=tracking_curr_data['im'].device)
         else:
-            pixel_mask = None
+            tracking_pixel_mask = None
         
         # Optimization Iterations
         num_iters_mapping = config['mapping']['num_iters']
@@ -707,7 +717,7 @@ def rgbd_slam(config: dict):
                                                    config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
                                                    config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
                                                    plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
-                                                   tracking_iteration=iter, pixel_mask=pixel_mask)
+                                                   tracking_iteration=iter, pixel_mask=tracking_pixel_mask)
                 
                 # if config_sample_fn == 'random':
                     # pixel_mask = generate_pixel_mask(tracking_curr_data['im'], (tracking_scale, tracking_scale), tracking_sample_fn, device=tracking_curr_data['im'].device) 
@@ -739,6 +749,7 @@ def rgbd_slam(config: dict):
                 iter_end_time = time.time()
                 tracking_iter_time_sum += iter_end_time - iter_start_time
                 tracking_iter_time_count += 1
+
                 # Check if we should stop tracking
                 iter += 1
                 if iter == num_iters_tracking:
@@ -843,7 +854,7 @@ def rgbd_slam(config: dict):
             mapping_start_time = time.time()
             if num_iters_mapping > 0:
                 progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Time Step: {time_idx}")
-            pixel_mask = None
+
             for iter in range(num_iters_mapping):
                 iter_start_time = time.time()
                 # Randomly select a frame until current time step amongst keyframes
@@ -855,33 +866,43 @@ def rgbd_slam(config: dict):
                     iter_color = color
                     iter_depth = depth
                     iter_novelty = variables['novelty']
+                    counter = 0
                 else:
                     # Use Keyframe Data
                     iter_time_idx = keyframe_list[selected_rand_keyframe_idx]['id']
                     iter_color = keyframe_list[selected_rand_keyframe_idx]['color']
                     iter_depth = keyframe_list[selected_rand_keyframe_idx]['depth']
                     iter_novelty = keyframe_list[selected_rand_keyframe_idx]['novelty'] 
+                    counter = keyframe_list[selected_rand_keyframe_idx]['counter']
+                    keyframe_list[selected_rand_keyframe_idx]['counter'] = (counter+1) % flip
+                    
                 iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
                 iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
                              'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
                 
-                if mapping_sample_fn != 'normal':
+                if mapping_sample_fn != 'normal' and counter and (time_idx < num_frames - 2): # -1 & 0
+                    # C, H, W = iter_color.shape
+                    # mapping_pixel_mask = sample_texture_and_random_patches_mask(iter_color, 2, 2, min(H, W) // 4).contiguous()
                     C, H, W = iter_color.shape
-                    pixel_mask = torch.zeros((H, W), dtype=bool, device=iter_color.device)
-                    
-                    mask_flat = pixel_mask.view(-1)
-                    if 'novelty' in mapping_sample_fn:
-                        mask_flat |= iter_novelty
-                    
+                    mapping_pixel_mask = torch.zeros((H, W), dtype=bool, device=iter_color.device)
                     if 'random' in mapping_sample_fn:
-                        num_samples = ((H + mapping_scale - 1) // mapping_scale) * ((W + mapping_scale - 1) // mapping_scale)
-                        selected_indices = torch.randperm(H * W, device=device)[:num_samples]
-                        mask_flat[selected_indices] = True
+                        # random_mask = sample_random_patches_mask(iter_color, 4096*10, mapping_scale)
+                        num_samples = H * W // (mapping_scale ** 2)
+                        random_mask = adaptive_random_sampling(iter_color, num_samples)
+                        # half_samples = num_samples // 2
+                        # random_mask = sample_texture_and_random_mask(iter_color, half_samples, half_samples)
+                        mapping_pixel_mask = mapping_pixel_mask | random_mask
+                    
+                    if 'novelty' in mapping_sample_fn and iter_novelty is not None:
+                        mask_flat = mapping_pixel_mask.view(-1)                    
+                        mask_flat |= iter_novelty
+                else:
+                    mapping_pixel_mask = None
                         
                 # Loss for current frame
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
-                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True, pixel_mask=pixel_mask)
+                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True, pixel_mask=mapping_pixel_mask)
                 if config['use_wandb']:
                     # Report Loss
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
@@ -954,10 +975,25 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Initialize Keyframe Info
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'novelty': variables['novelty']}
+                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'novelty': variables['novelty'], 'counter': 1 }
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
                 keyframe_time_indices.append(time_idx)
+        
+        if config['visualize_mask']:
+            C, H, W = color.shape
+            # pixel_mask = sample_texture_and_random_patches_mask(iter_color, 5, 1, min(H, W) // 4)
+            pixel_mask = adaptive_random_sampling(color, H * W // (mapping_scale ** 2))
+            # pixel_mask = expand_mask_to_3x3(pixel_mask)
+            row_indices, col_indices = torch.where(pixel_mask)
+            color_masked = (color.clone().permute(1, 2, 0) * 255).clamp(0, 255)
+            red = torch.tensor([255, 0, 0], dtype=color.dtype, device=color.device)
+            color_masked[row_indices, col_indices] = red
+            save_image = color_masked.cpu().numpy()
+            save_masked_dir = os.path.join(eval_dir, "masked_frames")
+
+            os.makedirs(save_masked_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(save_masked_dir, "{:04d}.png".format(time_idx)), cv2.cvtColor(save_image, cv2.COLOR_RGB2BGR))
         
         # Checkpoint every iteration
         if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
@@ -1032,6 +1068,7 @@ if __name__ == "__main__":
     parser.add_argument("--mapping_fn", type=str, default="normal")
     parser.add_argument("--tracking_scale", type=int, default=16)
     parser.add_argument("--mapping_scale", type=int, default=8)
+    parser.add_argument("--flip", type=int, default=4)
 
     args = parser.parse_args()
 
@@ -1043,6 +1080,7 @@ if __name__ == "__main__":
     experiment.config['mapping_sample_fn'] = args.mapping_fn
     experiment.config['tracking_scale'] = args.tracking_scale
     experiment.config['mapping_scale'] = args.mapping_scale
+    experiment.config['flip'] = args.flip
     
     print(f"Tracking sparse function: {args.tracking_fn}")
     print(f"mapping sparse function: {args.mapping_fn}")

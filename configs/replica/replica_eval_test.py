@@ -14,7 +14,7 @@ seed = 0
 scene_name = scenes[int(os.environ["SCENE_NUM"])]
 group_name = os.environ["GROUP_NAME"]
 
-map_every = 1
+map_every = 4
 keyframe_every = 5
 mapping_window_size = 24
 tracking_iters = 40
@@ -24,6 +24,7 @@ mapping_iters = 60
 run_name = f"{scene_name}_{seed}"
 
 config = dict(
+    visualize_mask=False,
     workdir=f"./experiments/{group_name}",
     run_name=run_name,
     seed=seed,
