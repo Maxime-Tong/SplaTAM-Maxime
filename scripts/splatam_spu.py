@@ -36,7 +36,6 @@ from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, dens
 from utils.mask_utils import *
 from utils.loss_utils import calc_ssim_shuffled_packed, gradient_loss
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
-from utils.visual_utils import visualize_loss_heatmaps
 
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
@@ -214,7 +213,7 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
 
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
-             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None, pixel_mask=None):
+             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None, pixel_mask=None, return_render=False):
     # Initialize Loss Dictionary
     losses = {}
 
@@ -272,7 +271,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     if tracking and use_sil_for_loss:
         mask = mask & presence_sil_mask
         
-    if pixel_mask is not None:
+    if tracking and pixel_mask is not None:
         mask = mask & pixel_mask
 
     # Depth loss
@@ -280,12 +279,10 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         mask = mask.detach()
         if tracking:
             losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].sum()
-        elif pixel_mask is not None:
+        elif mapping and pixel_mask is not None:
             losses['depth'] = 0.0
         else:
             losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].mean()
-            variables['depth'] = depth
-            variables['gt_depth'] = curr_data['depth']
     
     # RGB Loss
     if tracking and (use_sil_for_loss or ignore_outlier_depth_loss):
@@ -295,24 +292,20 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     elif tracking:
         losses['im'] = torch.abs(curr_data['im'] - im).sum()
     else:
-        # if pixel_mask is not None:
-        #     color_mask = torch.tile(pixel_mask, (3, 1, 1))
-        #     color_mask = color_mask.detach()
-        #     losses['im'] = 0.8 * l1_loss_v1(im[color_mask], curr_data['im'][color_mask]) + 0.2 * (1.0 - calc_ssim(im, curr_data['im'], color_mask=color_mask))
-        # else:
-        #     losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
-        
         if mapping and pixel_mask is not None:
             # expanded_mask = expand_mask_to_3x3(pixel_mask)
             color_mask = torch.tile(pixel_mask, (3, 1, 1))
             color_mask = color_mask.detach()
-            losses['im'] = 0.8 * l1_loss_v1(im[color_mask], curr_data['im'][color_mask]) + 0.2 * gradient_loss(im, curr_data['im'], pixel_mask.unsqueeze(0)) 
-            # losses['im'] = 0.8 * l1_loss_v1(im[color_mask], curr_data['im'][color_mask]) + 0.2 * (1.0 - calc_ssim(im, curr_data['im'], color_mask=color_mask))
-            # losses['im'] = 0.6 * l1_loss_v1(im[color_mask], curr_data['im'][color_mask]) + 0.2 * gradient_loss(im, curr_data['im'], color_mask) + 0.2 * (1.0 - calc_ssim_shuffled_packed(im, curr_data['im'], pixel_mask))
+            losses['im'] = 0.8 * (torch.abs(curr_data['im'] - im)[color_mask].mean()) + 0.2 * (1.0 - calc_ssim_shuffled_packed(im, curr_data['im'], pixel_mask))
         else:
             losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
-            variables['im'] = im
-            variables['gt_im'] = curr_data['im']
+    
+    if return_render:
+        im.retain_grad()
+        render_pkg = {
+            'im': im,
+            'depth': depth
+        }
 
     # Visualize the Diff Images
     if tracking and visualize_tracking_loss:
@@ -369,7 +362,10 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     variables['seen'] = seen
     weighted_losses['loss'] = loss
 
-    return loss, variables, weighted_losses
+    if return_render:
+        return loss, variables, weighted_losses, render_pkg
+    else:
+        return loss, variables, weighted_losses
 
 
 def initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution):
@@ -669,6 +665,8 @@ def rgbd_slam(config: dict):
     tracking_sample_fn = config['tracking_sample_fn']
     mapping_scale = config['mapping_scale']
     mapping_sample_fn = config['mapping_sample_fn']
+    flip = config['flip']
+    tracking_pixel_mask = None
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
         # Load RGBD frames incrementally instead of all frames
@@ -696,10 +694,6 @@ def rgbd_slam(config: dict):
         else:
             tracking_curr_data = curr_data
 
-        if tracking_sample_fn != 'normal':
-            tracking_pixel_mask = generate_pixel_mask(tracking_curr_data['im'], (tracking_scale, tracking_scale), tracking_sample_fn, device=tracking_curr_data['im'].device)
-        else:
-            tracking_pixel_mask = None
         
         # Optimization Iterations
         num_iters_mapping = config['mapping']['num_iters']
@@ -725,12 +719,20 @@ def rgbd_slam(config: dict):
             while True:
                 iter_start_time = time.time()
                 # Loss for current frame
-                loss, variables, losses = get_loss(params, tracking_curr_data, variables, iter_time_idx, config['tracking']['loss_weights'],
-                                                   config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
-                                                   config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
-                                                   plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
-                                                   tracking_iteration=iter, pixel_mask=tracking_pixel_mask)
-                
+                if iter == 0:
+                    loss, variables, losses, render_pkg = get_loss(params, tracking_curr_data, variables, iter_time_idx, config['tracking']['loss_weights'],
+                                                    config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
+                                                    config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
+                                                    plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
+                                                    tracking_iteration=iter, return_render=True)
+
+                else:
+                    loss, variables, losses = get_loss(params, tracking_curr_data, variables, iter_time_idx, config['tracking']['loss_weights'],
+                                config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
+                                config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
+                                plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
+                                tracking_iteration=iter, return_render=False, pixel_mask=tracking_pixel_mask)
+
                 # if config_sample_fn == 'random':
                     # pixel_mask = generate_pixel_mask(tracking_curr_data['im'], (tracking_scale, tracking_scale), tracking_sample_fn, device=tracking_curr_data['im'].device) 
                     
@@ -739,6 +741,13 @@ def rgbd_slam(config: dict):
                     wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
                 # Backprop
                 loss.backward()
+                if iter == 0:
+                    Lframe = render_pkg['im'].grad.detach().clone().mean(dim=0)
+                    C, H, W = tracking_curr_data['im'].shape
+                    # scale = 1 - 1 / (tracking_scale ** 2)
+                    tracking_pixel_mask = sparse_loss_sampling(Lframe, 0.7)
+                    # print(tracking_pixel_mask.sum() / (H * W))
+                    # print(tracking_pixel_mask.sum())
                 # Optimizer Update
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -867,6 +876,7 @@ def rgbd_slam(config: dict):
             if num_iters_mapping > 0:
                 progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Time Step: {time_idx}")
 
+            cur_counter = 0
             for iter in range(num_iters_mapping):
                 iter_start_time = time.time()
                 # Randomly select a frame until current time step amongst keyframes
@@ -878,31 +888,27 @@ def rgbd_slam(config: dict):
                     iter_color = color
                     iter_depth = depth
                     iter_novelty = variables['novelty']
-                    is_full = True
+                    counter = cur_counter
+                    cur_counter = (cur_counter + 1) % flip
                 else:
                     # Use Keyframe Data
                     iter_time_idx = keyframe_list[selected_rand_keyframe_idx]['id']
                     iter_color = keyframe_list[selected_rand_keyframe_idx]['color']
                     iter_depth = keyframe_list[selected_rand_keyframe_idx]['depth']
                     iter_novelty = keyframe_list[selected_rand_keyframe_idx]['novelty'] 
-                    is_full = keyframe_list[selected_rand_keyframe_idx]['is_full']
-                    keyframe_list[selected_rand_keyframe_idx]['is_full'] = (not is_full)
+                    counter = keyframe_list[selected_rand_keyframe_idx]['counter']
+                    keyframe_list[selected_rand_keyframe_idx]['counter'] = (counter+1) % flip
                     
                 iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
                 iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
                              'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
                 
-                if mapping_sample_fn != 'normal' and not is_full and (time_idx < num_frames - 2): # -1 & 0
-                    # C, H, W = iter_color.shape
-                    # mapping_pixel_mask = sample_texture_and_random_patches_mask(iter_color, 2, 2, min(H, W) // 4).contiguous()
+                if mapping_sample_fn != 'normal' and counter and (time_idx < num_frames - 2): # -1 & 0
                     C, H, W = iter_color.shape
                     mapping_pixel_mask = torch.zeros((H, W), dtype=bool, device=iter_color.device)
                     if 'random' in mapping_sample_fn:
-                        # random_mask = sample_random_patches_mask(iter_color, 4096*10, mapping_scale)
-                        # random_mask = adaptive_random_sampling(iter_color, num_samples)
                         num_samples = H * W // (mapping_scale ** 2)
-                        half_samples = num_samples // 2
-                        random_mask = sample_texture_and_random_mask(iter_color, half_samples, half_samples)
+                        random_mask = adaptive_random_sampling(iter_color, num_samples)
                         mapping_pixel_mask = mapping_pixel_mask | random_mask
                     
                     if 'novelty' in mapping_sample_fn and iter_novelty is not None:
@@ -987,16 +993,25 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Initialize Keyframe Info
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'novelty': variables['novelty'], 'is_full': False }
+                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'novelty': variables['novelty'], 'counter': cur_counter }
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
                 keyframe_time_indices.append(time_idx)
         
-        if config['visualize_mask'] and time_idx > num_frames - 10:
+        if config['visualize_mask']:
+            C, H, W = color.shape
+            # pixel_mask = sample_texture_and_random_patches_mask(iter_color, 5, 1, min(H, W) // 4)
+            pixel_mask = adaptive_random_sampling(color, H * W // (mapping_scale ** 2))
+            # pixel_mask = expand_mask_to_3x3(pixel_mask)
+            row_indices, col_indices = torch.where(pixel_mask)
+            color_masked = (color.clone().permute(1, 2, 0) * 255).clamp(0, 255)
+            red = torch.tensor([255, 0, 0], dtype=color.dtype, device=color.device)
+            color_masked[row_indices, col_indices] = red
+            save_image = color_masked.cpu().numpy()
             save_masked_dir = os.path.join(eval_dir, "masked_frames")
+
             os.makedirs(save_masked_dir, exist_ok=True)
-            save_path = os.path.join(save_masked_dir, "{:04d}.png".format(time_idx))
-            visualize_loss_heatmaps(variables['im'], variables['gt_im'], variables['depth'], variables['gt_depth'], save_path)
+            cv2.imwrite(os.path.join(save_masked_dir, "{:04d}.png".format(time_idx)), cv2.cvtColor(save_image, cv2.COLOR_RGB2BGR))
         
         # Checkpoint every iteration
         if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
@@ -1071,6 +1086,7 @@ if __name__ == "__main__":
     parser.add_argument("--mapping_fn", type=str, default="normal")
     parser.add_argument("--tracking_scale", type=int, default=16)
     parser.add_argument("--mapping_scale", type=int, default=8)
+    parser.add_argument("--flip", type=int, default=4)
 
     args = parser.parse_args()
 
@@ -1082,6 +1098,7 @@ if __name__ == "__main__":
     experiment.config['mapping_sample_fn'] = args.mapping_fn
     experiment.config['tracking_scale'] = args.tracking_scale
     experiment.config['mapping_scale'] = args.mapping_scale
+    experiment.config['flip'] = args.flip
     
     print(f"Tracking sparse function: {args.tracking_fn}")
     print(f"mapping sparse function: {args.mapping_fn}")

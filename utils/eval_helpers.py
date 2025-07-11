@@ -566,7 +566,7 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         gt_w2c_list = valid_gt_w2c_list
         # Calculate ATE RMSE
         ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list)
-        print("Final Average ATE RMSE: {:.2f} cm".format(ate_rmse*100))
+        print("Final Average ATE RMSE: {:.4f} cm".format(ate_rmse*100))
         if wandb_run is not None:
             wandb_run.log({"Final Stats/Avg ATE RMSE": ate_rmse,
                         "Final Stats/step": 1})

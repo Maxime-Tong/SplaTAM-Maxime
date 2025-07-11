@@ -3,6 +3,7 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torchvision.transforms.functional import gaussian_blur
 
 def expand_mask_to_3x3(mask):
     # (1, 1, H, W)
@@ -42,6 +43,7 @@ def sample_texture_and_random_mask(image: torch.Tensor,
     
     # Add batch and channel dimensions for conv2d
     gray = gray.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    # gray = gaussian_blur(gray, kernel_size=5, sigma=1.0)
     
     # Compute gradients with padding
     Gx = F.conv2d(gray, kernel_x, padding=sobel_kernel_size//2)
@@ -104,6 +106,7 @@ def compute_gradient_mag(image, sobel_kernel_size=3, epsilon=0.001):
     
     # Add batch and channel dimensions for conv2d
     gray = gray.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    gray = gaussian_blur(gray, kernel_size=5, sigma=1.0)
     
     # Compute gradients
     Gx = F.conv2d(gray, kernel_x, padding=sobel_kernel_size//2)
@@ -125,37 +128,21 @@ def compute_gradient_mag(image, sobel_kernel_size=3, epsilon=0.001):
 def adaptive_random_sampling(
     image: torch.Tensor, 
     num_samples: int, 
+    selection_counts: torch.Tensor,
     epsilon: float = 0.001,
-    sobel_kernel_size: int = 3
 ) -> torch.Tensor:
-    """
-    Adaptive random sampling based on texture richness (gradient magnitude).
-    Generates a binary mask with exactly num_samples pixels set to 1 (selected).
-    
-    Args:
-        image: Input image tensor (C x H x W) where C=1 (grayscale) or 3 (RGB)
-        num_samples: Total number of pixels to sample
-        epsilon: Small constant to ensure non-zero sampling probability everywhere
-        sobel_kernel_size: Size of Sobel kernel (3 or 5 recommended)
-    
-    Returns:
-        Binary mask tensor (H x W) where 1 indicates sampled pixels
-    """
     device = image.device
-    G = compute_gradient_mag(image, sobel_kernel_size=sobel_kernel_size, epsilon=epsilon)
+    C, H, W = image.shape
     
-    # Step 3: Normalize gradient magnitudes to [0, 1]
-    G_min = G.min()
-    G_max = G.max()
-    G_norm = (G - G_min) / (G_max - G_min + 1e-7)  # Avoid division by zero
-
-    # Step 4: Create sampling probability map
-    P = G_norm + epsilon
-    P_flat = P.view(-1)  # Flatten to (H*W,)
+    counts_norm = 1.0 / (selection_counts.float() + 1)  # +1 to avoid division by zero
+    counts_min = counts_norm.min()
+    counts_max = counts_norm.max()
+    counts_norm = (counts_norm - counts_min) / (counts_max - counts_min + 1e-7)
+    
+    P_combined = counts_norm + epsilon
+    P_flat = P_combined.view(-1)  # Flatten to (H*W,)
     P_flat = P_flat / P_flat.sum()  # Normalize to sum to 1
     
-    # Step 5: Sample indices according to probabilities
-    # Create CDF (cumulative distribution function)
     cdf = torch.cumsum(P_flat, dim=0)
     cdf = cdf / cdf[-1]  # Ensure CDF ends at 1.0
     
@@ -163,18 +150,66 @@ def adaptive_random_sampling(
     rand_vals = torch.rand(num_samples, device=device)
     sampled_indices = torch.searchsorted(cdf, rand_vals)
     
-    # Step 6: Create output mask
+    # Step 5: Create output mask and update selection counts
     mask_flat = torch.zeros(P_flat.shape, dtype=bool, device=device)
     mask_flat[sampled_indices] = 1
-    mask = mask_flat.view(G.shape)  # Reshape to original dimensions
+    mask = mask_flat.view(H, W)  # Reshape to original dimensions
     
     return mask
 
-def generate_random_mask(H, W, num_samples, device='cuda'):
+# def adaptive_random_sampling(
+#     image: torch.Tensor, 
+#     num_samples: int, 
+#     epsilon: float = 0.001,
+#     sobel_kernel_size: int = 3
+# ) -> torch.Tensor:
+#     """
+#     Adaptive random sampling based on texture richness (gradient magnitude).
+#     Generates a binary mask with exactly num_samples pixels set to 1 (selected).
+    
+#     Args:
+#         image: Input image tensor (C x H x W) where C=1 (grayscale) or 3 (RGB)
+#         num_samples: Total number of pixels to sample
+#         epsilon: Small constant to ensure non-zero sampling probability everywhere
+#         sobel_kernel_size: Size of Sobel kernel (3 or 5 recommended)
+    
+#     Returns:
+#         Binary mask tensor (H x W) where 1 indicates sampled pixels
+#     """
+#     device = image.device
+#     G = compute_gradient_mag(image, sobel_kernel_size=sobel_kernel_size, epsilon=epsilon)
+    
+#     # Step 3: Normalize gradient magnitudes to [0, 1]
+#     G_min = G.min()
+#     G_max = G.max()
+#     G_norm = (G - G_min) / (G_max - G_min + 1e-7)  # Avoid division by zero
+
+#     # Step 4: Create sampling probability map
+#     P = G_norm + epsilon
+#     P_flat = P.view(-1)  # Flatten to (H*W,)
+#     P_flat = P_flat / P_flat.sum()  # Normalize to sum to 1
+    
+#     # Step 5: Sample indices according to probabilities
+#     # Create CDF (cumulative distribution function)
+#     cdf = torch.cumsum(P_flat, dim=0)
+#     cdf = cdf / cdf[-1]  # Ensure CDF ends at 1.0
+    
+#     # Generate random numbers and find corresponding indices
+#     rand_vals = torch.rand(num_samples, device=device)
+#     sampled_indices = torch.searchsorted(cdf, rand_vals)
+    
+#     # Step 6: Create output mask
+#     mask_flat = torch.zeros(P_flat.shape, dtype=bool, device=device)
+#     mask_flat[sampled_indices] = 1
+#     mask = mask_flat.view(G.shape)  # Reshape to original dimensions
+    
+#     return mask
+
+def generate_random_mask(H, W, num_samples, novelty=None, device='cuda'):
     mask = torch.zeros((H, W), dtype=bool, device=device)
     selected_indices = torch.randperm(H * W, device=device)[:num_samples]    
     mask_flat = mask.view(-1)
-    mask_flat[selected_indices] = True
+    mask_flat[selected_indices] = True    
     return mask
 
 # for tracking

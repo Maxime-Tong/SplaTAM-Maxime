@@ -1,20 +1,12 @@
 #!/bin/bash
 # 配置参数
 MIN_GPU_MEMORY=20000  # 最小需要的GPU显存(MB)，根据你的需求调整
-datasets=(1 2 3 4 5 6 7)
+datasets=(0 1 2 3 4 5 6 7)
 args_combinations=(
-    # "16 4 uniform normal"
-    # "16 4 harris normal"
-    # "16 4 random normal"
-    "8 4 uniform normal"
-    "8 4 harris normal"
-    "8 4 random normal"
-    # "32 4 uniform normal"
-    # "32 4 harris normal"
-    # "32 4 random normal"
+    "8 10 uniform random_texture_flip_8"
 )
 
-LOG_DIR="logs/tracking"
+LOG_DIR="logs/mapping"
 mkdir -p "$LOG_DIR"
 
 config_path="configs/replica/replica_eval_test.py" # PATH TO YOUR MODELS
