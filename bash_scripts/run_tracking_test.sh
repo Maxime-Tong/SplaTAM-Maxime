@@ -3,15 +3,19 @@
 MIN_GPU_MEMORY=20000  # 最小需要的GPU显存(MB)，根据你的需求调整
 datasets=(0 1 2 3 4 5 6 7)
 args_combinations=(
+    # "8 4 loss normal"
+    # "16 4 loss normal"
+    "32 4 loss normal"
+
     # "16 4 uniform normal"
     # "16 4 harris normal"
     # "16 4 random normal"
     # "8 4 uniform normal"
     # "8 4 harris normal"
     # "8 4 random normal"
-    "32 4 uniform normal"
-    "32 4 harris normal"
-    "32 4 random normal"
+    # "32 4 uniform normal"
+    # "32 4 harris normal"
+    # "32 4 random normal"
 )
 
 LOG_DIR="logs/tracking"
@@ -61,7 +65,7 @@ run_task() {
         export SCENE_NUM=${dataset_name}
         export GROUP_NAME=${group_name}
 
-        python3 -u scripts/splatam_test.py configs/replica/replica_eval_test.py --tracking_fn $t_fn --tracking_scale $t_scale --mapping_fn $m_fn --mapping_scale $m_scale
+        python3 -u scripts/splatam_spu.py configs/replica/replica_eval_test.py --tracking_fn $t_fn --tracking_scale $t_scale --mapping_fn $m_fn --mapping_scale $m_scale
         
     } >> "${log_prefix}.log" 2>&1
     

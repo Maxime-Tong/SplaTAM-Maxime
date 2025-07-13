@@ -35,46 +35,11 @@ from utils.slam_helpers import (
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
 from utils.mask_utils import *
 from utils.loss_utils import calc_ssim_shuffled_packed, gradient_loss
+from utils.pose_utils import compute_transformation, back_project, depth_truncation
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
-import random
-from typing import List
-
-def loss_weighted_sampling(frame_ids: List[int], 
-                          losses: List[float], 
-                          p_priority: float = 0.4) -> int:
-    """
-    基于损失值加权和随机采样的混合采样策略
-    
-    Args:
-        frame_ids: 帧ID列表
-        losses: 对应的损失值列表
-        p_priority: 使用加权采样的概率(默认0.4)
-    
-    Returns:
-        采样得到的帧ID
-    
-    Note:
-        1. 以概率p_priority按损失值比例加权采样
-        2. 以概率1-p_priority均匀随机采样
-        3. 损失值为负时会被视为0
-    """
-    assert len(frame_ids) == len(losses), "帧ID和损失值列表长度必须相同"
-    assert 0 <= p_priority <= 1, "优先级概率必须在[0,1]范围内"
-
-    # 处理负损失值(视为0)
-    losses = [max(0, loss) for loss in losses]
-    
-    if random.random() < p_priority:
-        # 加权采样模式
-        total_loss = sum(losses)
-        if total_loss > 0:
-            # 按损失值比例计算采样概率
-            probs = [loss / total_loss for loss in losses]
-            return random.choices(frame_ids, weights=probs, k=1)[0]
-    
-    # 随机采样模式(包括加权采样失败的情况)
-    return random.choice(frame_ids)
+from lightglue import LightGlue, SuperPoint
+from lightglue.utils import rbd
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
     if config_dict["dataset_name"].lower() in ["icl"]:
@@ -693,6 +658,12 @@ def rgbd_slam(config: dict):
     mapping_sample_fn = config['mapping_sample_fn']
     flip = config['flip']
     # Iterate over Scan
+    
+    extractor = SuperPoint(max_num_keypoints=None).eval().to(device)
+    matcher = LightGlue(features='superpoint', depth_confidence=-1, width_confidence=-1).eval().to(device)
+    prev_features = None
+    intrinsics_np = intrinsics.cpu().numpy()
+    
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
         # Load RGBD frames incrementally instead of all frames
         color, depth, _, gt_pose = dataset[time_idx]
@@ -734,6 +705,42 @@ def rgbd_slam(config: dict):
         # Tracking
         tracking_start_time = time.time()
         if time_idx > 0 and not config['tracking']['use_gt_poses']:
+            cur_features = {
+                'features': extractor.extract(color),
+                'depth': depth.detach().cpu().numpy()[0]
+            }
+            
+            if prev_features is not None:
+                with torch.no_grad():
+                    matches01 = matcher({'image0': prev_features['features'], 'image1': cur_features['features']})
+                    feats0, feats1, matches01 = [rbd(x) for x in [prev_features['features'], cur_features['features'], matches01]]  # remove batch dimension
+                    matches = matches01['matches']
+                    
+                    # Get matched points
+                    points0 = feats0['keypoints'][matches[..., 0]].cpu().numpy().astype(np.float32)
+                    points1 = feats1['keypoints'][matches[..., 1]].cpu().numpy().astype(np.float32)
+                    
+                    pt0_3d = back_project(points0, prev_features['depth'], intrinsics_np)
+                    pt1_3d = back_project(points1, cur_features['depth'], intrinsics_np)
+                    pt0_3d_filtered, pt1_3d_filtered = depth_truncation(pt0_3d, pt1_3d, prev_features['depth'], cur_features['depth'], 70)         
+                    # transformation = compute_transformation(pt0_3d_filtered, pt1_3d_filtered)
+                    reg_result = compute_transformation(pt0_3d_filtered, pt1_3d_filtered, threshold=0.1, max_iterations=2000, return_dict=True)
+                    transformation = reg_result.transformation
+                    print(reg_result.fitness, reg_result.inlier_rmse)
+                    if reg_result.fitness > 0.3 and reg_result.inlier_rmse < 0.1:
+                        transformation = torch.from_numpy(transformation.copy()).float().to(device=device)
+                        view_matrix_prev = torch.eye(4, device=device, dtype=torch.float32)
+                
+                        view_matrix_prev[:3, :3] = build_rotation(F.normalize(params['cam_unnorm_rots'][..., time_idx-1].detach()))
+                        view_matrix_prev[:3, 3] = params['cam_trans'][..., time_idx-1].detach()
+                        
+                        view_matrix_cur = transformation @ view_matrix_prev
+                        
+                        params['cam_unnorm_rots'][..., time_idx] = matrix_to_quaternion(view_matrix_cur[:3, :3])
+                        params['cam_trans'][..., time_idx] = view_matrix_cur[:3, 3]
+                
+            prev_features = cur_features
+            
             # Reset Optimizer & Learning Rates for tracking
             optimizer = initialize_optimizer(params, config['tracking']['lrs'], tracking=True)
             # Keep Track of Best Candidate Rotation & Translation
@@ -872,14 +879,11 @@ def rgbd_slam(config: dict):
                 num_keyframes = config['mapping_window_size']-2
                 selected_keyframes = keyframe_selection_overlap(depth, curr_w2c, intrinsics, keyframe_list[:-1], num_keyframes)
                 selected_time_idx = [keyframe_list[frame_idx]['id'] for frame_idx in selected_keyframes]
-                selected_loss_list = [keyframe_list[frame_idx]['loss'] for frame_idx in selected_keyframes]
                 if len(keyframe_list) > 0:
                     # Add last keyframe to the selected keyframes
-                    selected_loss_list.append(keyframe_list[-1]['loss'])
                     selected_time_idx.append(keyframe_list[-1]['id'])
                     selected_keyframes.append(len(keyframe_list)-1)
                 # Add current frame to the selected keyframes
-                selected_loss_list.append(1.0) 
                 selected_time_idx.append(time_idx)
                 selected_keyframes.append(-1)
                 # Print the selected keyframes
@@ -896,10 +900,8 @@ def rgbd_slam(config: dict):
             for iter in range(num_iters_mapping):
                 iter_start_time = time.time()
                 # Randomly select a frame until current time step amongst keyframes
-                # rand_idx = np.random.randint(0, len(selected_keyframes))
-                # selected_rand_keyframe_idx = selected_keyframes[rand_idx]
-                rand_idx = loss_weighted_sampling(list(range(len(selected_loss_list))), selected_loss_list)
-                selected_rand_keyframe_idx = selected_keyframes[rand_idx] 
+                rand_idx = np.random.randint(0, len(selected_keyframes))
+                selected_rand_keyframe_idx = selected_keyframes[rand_idx]
                 if selected_rand_keyframe_idx == -1:
                     # Use Current Frame Data
                     iter_time_idx = time_idx
@@ -943,7 +945,6 @@ def rgbd_slam(config: dict):
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
                                                 config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True, pixel_mask=mapping_pixel_mask)
-                selected_loss_list[rand_idx] = loss.item()
                 if config['use_wandb']:
                     # Report Loss
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
@@ -1016,8 +1017,7 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Initialize Keyframe Info
-                print(selected_loss_list)
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'novelty': variables['novelty'], 'counter': 1, 'loss': selected_loss_list[-1] }
+                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'novelty': variables['novelty'], 'counter': 1 }
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
                 keyframe_time_indices.append(time_idx)

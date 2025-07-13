@@ -1,13 +1,12 @@
 #!/bin/bash
 # 配置参数
-MIN_GPU_MEMORY=15000  # 最小需要的GPU显存(MB)，根据你的需求调整
+MIN_GPU_MEMORY=20000  # 最小需要的GPU显存(MB)，根据你的需求调整
 datasets=(0 1 2 3 4 5 6 7)
 args_combinations=(
-    "16 4 uniform novelty_random"
-    # "16 12 uniform novelty_random"
+    "16 4 normal uniform_flip_4_w_depth"
 )
-# datasets=("room" "stump")
-LOG_DIR="logs"
+
+LOG_DIR="logs/mapping"
 mkdir -p "$LOG_DIR"
 
 config_path="configs/replica/replica_eval_test.py" # PATH TO YOUR MODELS
@@ -45,7 +44,7 @@ run_task() {
     
 
     local timestamp=$(date +"%Y%m%d_%H%M%S")
-    local group_name="${t_fn}_${t_scale}_${m_fn}_${m_scale}_l1_s3im_depth_8_flip"
+    local group_name="${t_fn}_${t_scale}_${m_fn}_${m_scale}"
     local log_prefix="${LOG_DIR}/${group_name}_${dataset_name}"
 
     echo "Running scene ${dataset_name} (${group_name}) on GPU ${gpu_id}" | tee -a "${log_prefix}.log"
@@ -54,7 +53,7 @@ run_task() {
         export SCENE_NUM=${dataset_name}
         export GROUP_NAME=${group_name}
 
-        python3 -u scripts/splatam_test.py configs/replica/replica_eval_test.py --tracking_fn $t_fn --tracking_scale $t_scale --mapping_fn $m_fn --mapping_scale $m_scale --flip 8
+        python3 -u scripts/splatam_uniform.py configs/replica/replica_eval_test.py --tracking_fn $t_fn --tracking_scale $t_scale --mapping_fn $m_fn --mapping_scale $m_scale --flip 4
         
     } >> "${log_prefix}.log" 2>&1
     

@@ -565,97 +565,57 @@ def generate_tile_center_mask(image_shape, tile_size, device='cuda'):
     return mask, intensity_mask
 
 
-def sparse_loss_sampling(
-    frame_loss: torch.Tensor,
-    sparse_ratio: float,
-    tile_size: tuple[int, int] = (16, 16),
-    grid_size: tuple[int, int] = (64, 64),
-    dilation: bool = True
-) -> torch.Tensor:
+def generate_max_loss_mask(loss_map, tile_size, device='cuda'):
     """
-    Sparse Tile Sampling (STS) for efficient pose tracking region selection.
+    Generate a mask with 1 at the position of maximum loss in each tile over the image,
+    and return an intensity mask with the corresponding loss values.
     
     Args:
-        frame_loss: Rendering loss tensor (H x W)
-        sparse_ratio: Ratio of tiles to discard (0-1)
-        tile_size: Size of each tile (TX, TY)
-        grid_size: Size of each grid block (GX, GY)
-        dilation: Whether to apply dilation to sampled tiles
+        loss_map (torch.Tensor): Loss map of shape (H, W) or (1, H, W).
+        tile_size (tuple): (tile_h, tile_w) size of each tile.
     
     Returns:
-        Binary mask tensor (H x W) where 1 indicates sampled pixels
+        mask (torch.Tensor): Boolean mask of shape (H, W),
+                            with True at max loss positions, False elsewhere.
+        intensity_mask (torch.Tensor): Float tensor of shape (H, W),
+                                     with loss values at max positions, 0 elsewhere.
     """
-    device = frame_loss.device
-    H, W = frame_loss.shape
-    GX, GY = grid_size
-    TX, TY = tile_size
+    # Ensure loss_map is 2D
+    if len(loss_map.shape) == 3:
+        if loss_map.shape[0] == 1:
+            loss_map = loss_map.squeeze(0)
+        else:
+            raise ValueError("loss_map should be either (H, W) or (1, H, W)")
     
-    # # Validate dimensions
-    # assert H % GY == 0 and W % GX == 0, "Frame must be divisible by grid_size"
-    # assert GY % TY == 0 and GX % TX == 0, "Grid must be divisible by tile_size"
-    
-    # Calculate tile counts
-    Ngrid = (GX // TX) * (GY // TY)  # Tiles per grid
-    Ntotal = (W // GX) * (H // GY) * Ngrid  # Total tiles in frame
-    cropH, cropW = GY * (H // GY), GX * (W // GX)
-    
-    # 1. Partition frame into grids and compute block losses
-    grids = frame_loss[:cropH, :cropW].unfold(0, GY, GY).unfold(1, GX, GX)  # (n_gh, n_gw, GY, GX)
-    n_gh, n_gw = grids.shape[:2]
-    
-    # 2. Compute total frame loss (L1 norm)
-    L_total = torch.sum(torch.abs(frame_loss)) + 1e-7  # Avoid division by zero
-    
-    # Initialize output mask
-    mask = torch.zeros((cropH, cropW), dtype=torch.bool, device=device)
-    
-    # Process each grid block
-    for i in range(n_gh):
-        for j in range(n_gw):
-            grid = grids[i, j]
+    H, W = loss_map.shape
+    tile_h, tile_w = tile_size
+
+    # Initialize masks
+    mask = torch.zeros((H, W), dtype=torch.bool, device=device)
+    intensity_mask = torch.zeros((H, W), dtype=torch.float32, device=device)
+
+    # Process each tile
+    for top in range(0, H, tile_h):
+        for left in range(0, W, tile_w):
+            bottom = min(top + tile_h, H)
+            right = min(left + tile_w, W)
             
-            # 3. Compute block loss (L1 norm)
-            L_block = torch.sum(torch.abs(grid))
+            # Extract tile from loss map
+            tile = loss_map[top:bottom, left:right]
             
-            # 4. Calculate sampling probability density
-            L_pdf = L_block / L_total
-            
-            # 5. Determine number of tiles to sample
-            n_sample = min(
-                int(L_pdf * Ntotal * (1 - sparse_ratio)),
-                Ngrid
-            )
-            
-            if n_sample > 0:
-                # Create tile coordinates for this grid
-                ty, tx = torch.meshgrid(
-                    torch.arange(0, GY, TY, device=device),
-                    torch.arange(0, GX, TX, device=device),
-                    indexing='ij'
-                )
-                tile_coords = torch.stack((ty.flatten(), tx.flatten()), dim=1)
+            if tile.numel() == 0:  # Skip empty tiles
+                continue
                 
-                # Random sampling without replacement
-                selected_indices = torch.randperm(len(tile_coords), device=device)[:n_sample]
-                selected_coords = tile_coords[selected_indices]
-                
-                # Mark selected tiles in output mask
-                for ty, tx in selected_coords:
-                    gy, gx = i * GY, j * GX  # Grid origin
-                    mask[gy+ty:gy+ty+TY, gx+tx:gx+tx+TX] = True
+            # Find position of max loss in tile
+            max_val, max_idx = torch.max(tile.flatten(), dim=0)
+            max_pos = np.unravel_index(max_idx.item(), tile.shape)
+            
+            # Calculate absolute position in original image
+            abs_y = top + max_pos[0]
+            abs_x = left + max_pos[1]
+            
+            # Update masks
+            mask[abs_y, abs_x] = True
+            intensity_mask[abs_y, abs_x] = max_val
     
-    # Apply dilation if needed
-    if dilation and (TX > 1 or TY > 1):
-        # Create square dilation kernel matching tile size
-        kernel = torch.ones(TY, TX, dtype=torch.float32, device=device)
-        print(mask.shape)
-        mask = F.conv2d(
-            mask.float().view(1, 1, cropH, cropW),
-            kernel.view(1, 1, TY, TX),
-            padding=(TY//2, TX//2)
-        ) > 0
-        mask = mask[0, 0, :cropH, :cropW]
-    return_mask = torch.zeros((H, W), dtype=torch.bool, device=device)
-    return_mask[:cropH, :cropW] = mask
-    
-    return return_mask
+    return mask, intensity_mask

@@ -1,9 +1,9 @@
 #!/bin/bash
 # 配置参数
 MIN_GPU_MEMORY=20000  # 最小需要的GPU显存(MB)，根据你的需求调整
-datasets=(0 1 2 3 4 5 6 7)
+datasets=(0 1 2 3)
 args_combinations=(
-    "8 10 uniform random_texture_flip_8"
+    "8 4 harris random_texture_flip_4_w_depth"
 )
 
 LOG_DIR="logs/mapping"
@@ -53,7 +53,7 @@ run_task() {
         export SCENE_NUM=${dataset_name}
         export GROUP_NAME=${group_name}
 
-        python3 -u scripts/splatam_test.py configs/replica/replica_eval_test.py --tracking_fn $t_fn --tracking_scale $t_scale --mapping_fn $m_fn --mapping_scale $m_scale
+        python3 -u scripts/splatam_test.py configs/replica/replica_eval_test.py --tracking_fn $t_fn --tracking_scale $t_scale --mapping_fn $m_fn --mapping_scale $m_scale --flip 4
         
     } >> "${log_prefix}.log" 2>&1
     

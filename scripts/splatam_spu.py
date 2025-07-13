@@ -745,7 +745,8 @@ def rgbd_slam(config: dict):
                     Lframe = render_pkg['im'].grad.detach().clone().mean(dim=0)
                     C, H, W = tracking_curr_data['im'].shape
                     # scale = 1 - 1 / (tracking_scale ** 2)
-                    tracking_pixel_mask = sparse_loss_sampling(Lframe, 0.7)
+                    tracking_pixel_mask = generate_max_loss_mask(Lframe, (tracking_scale, tracking_scale), device=color.device)[0]
+                    print(tracking_pixel_mask.sum())
                     # print(tracking_pixel_mask.sum() / (H * W))
                     # print(tracking_pixel_mask.sum())
                 # Optimizer Update
